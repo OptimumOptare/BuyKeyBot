@@ -9,6 +9,8 @@ import {
 
 const provider = new JsonRpcProvider(config.rpcUrl, 143);
 const wallet = new Wallet(config.privateKey, provider);
+/** Read-only binding avoids attaching `from` on eth_call (some RPCs reject it). */
+const readContract = new Contract(config.contractAddress, config.abi, provider);
 const contract = new Contract(config.contractAddress, config.abi, wallet);
 
 let polling = false;
@@ -28,8 +30,30 @@ function formatRemaining(seconds: number): string {
   return `${seconds}s`;
 }
 
+function formatPollError(err: unknown): string {
+  if (!(err instanceof Error)) return String(err);
+  const info = (err as Error & { info?: { error?: { message?: string } } }).info;
+  const rpcMessage = info?.error?.message;
+  if (rpcMessage) {
+    return `${err.message} (RPC: ${rpcMessage})`;
+  }
+  return err.message;
+}
+
+async function assertRpcCanRead(): Promise<void> {
+  try {
+    await readContract.getFunction(config.readFunction).staticCall();
+  } catch (err) {
+    const detail = formatPollError(err);
+    throw new Error(
+      `RPC cannot read ${config.readFunction}() on ${config.contractAddress}: ${detail}. ` +
+        "Try MONAD_RPC_URL=https://rpc.monad.xyz (dRPC eth_call is broken on Monad).",
+    );
+  }
+}
+
 async function buyKeys(): Promise<string> {
-  const estimated = await estimateKeyPriceWei(contract);
+  const estimated = await estimateKeyPriceWei(readContract);
   const value = resolveBuyValueWei(config, estimated);
   const fn = contract.getFunction(config.buyFunction);
   const tx = await fn(config.buyTeam, config.referralRoute, { value });
@@ -49,14 +73,14 @@ async function pollOnce(): Promise<void> {
   polling = true;
   try {
     const remaining = await readSecondsRemaining(
-      contract,
+      readContract,
       provider,
       config.readFunction,
       config.readMode,
     );
     const [priceWei, lastBuyer] = await Promise.all([
-      estimateKeyPriceWei(contract),
-      contract.lastBuyer.staticCall() as Promise<string>,
+      estimateKeyPriceWei(readContract),
+      readContract.lastBuyer.staticCall() as Promise<string>,
     ]);
     const weAreLastBuyer =
       ethers.getAddress(lastBuyer) === ethers.getAddress(wallet.address);
@@ -84,7 +108,7 @@ async function pollOnce(): Promise<void> {
     );
     lastBuyHash = await buyKeys();
   } catch (err) {
-    console.error("Poll error:", err instanceof Error ? err.message : err);
+    console.error("Poll error:", formatPollError(err));
   } finally {
     polling = false;
   }
@@ -127,6 +151,8 @@ async function main(): Promise<void> {
   console.log(
     `Trigger: <= ${config.triggerSeconds}s, skip if lastBuyer=us | Poll: ${config.pollIntervalMs}ms`,
   );
+
+  await assertRpcCanRead();
 
   startHealthServer();
   await pollOnce();
